@@ -1,5 +1,6 @@
 pub mod streams;
 pub mod utils;
+pub mod bidirect;
 
 use utils::*;
 
