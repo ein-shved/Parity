@@ -1,6 +1,7 @@
 // Simple request-response-notify bidirectional binary protocol implementation
 // based on async
 
+pub mod bidirect;
 pub mod streams;
 pub mod utils;
 
