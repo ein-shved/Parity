@@ -110,6 +110,17 @@ where
                 }
                 Ok(())
             }
+
+            req = self.request_sender.recv() => Self::send_request_next(
+                    req,
+                    &mut self.seq_id,
+                    &mut self.send_queue,
+                    &mut self.outgoing_requests),
+
+            not = self.notice_sender.recv() => Self::send_notice_next(
+                    not,
+                    &mut self.send_queue),
+
         }
     }
 
@@ -185,6 +196,27 @@ where
             // TODO(Shvedov): Notify user about error
             Ok(())
         }
+    }
+
+    fn send_request_next(
+        req: Option<SelfRequest<Data>>,
+        si: &mut SI,
+        send_queue: &mut MessageQueue<Data, SI>,
+        requests_map: &mut OutRequestsMap<Data, SI>,
+    ) -> Status {
+        if let Some(req) = req {
+            send_queue.push_front(Message::Request(*si, req.msg));
+            requests_map.insert(*si, req.tx);
+            *si = (*si).inc();
+        }
+        Ok(())
+    }
+
+    fn send_notice_next(not: Option<Data>, send_queue: &mut MessageQueue<Data, SI>) -> Status {
+        if let Some(not) = not {
+            send_queue.push_front(Message::Notice(not));
+        }
+        Ok(())
     }
 }
 
