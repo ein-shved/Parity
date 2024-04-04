@@ -232,12 +232,42 @@ struct RequestImp<Data> {
     responser: oneshot::Sender<Result<Data>>,
 }
 
-impl<Data> Request<Data> for RequestImp<Data> {
+#[async_trait]
+impl<Data: Send> Request<Data> for RequestImp<Data> {
     fn get_data(&self) -> &Data {
         &self.data
     }
     async fn response(self, response: Result<Data>) -> Status {
         self.responser.send(response); // TODO .expect("Failed to send response");
         Ok(())
+    }
+}
+
+struct RequestSenderImpl<Data> {
+    channel: mpsc::Sender<SelfRequest<Data>>,
+}
+
+#[async_trait]
+impl<Data: Send> RequestSender<Data> for RequestSenderImpl<Data> {
+    async fn request(&mut self, req: Data) -> Result<Data> {
+        let (tx, rx) = oneshot::channel();
+        let req = SelfRequest { msg: req, tx };
+        self.channel.send(req).await.unwrap();
+        rx.await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn get_request_sender() {
+    let mut bidir = Bidirect::<String>::new();
+    let mut sender = bidir.get_request_sender();
+    _ = sender.request(String::from("Hello world!"));
+}
+
+impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
+    fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
+        RequestSenderImpl {
+            channel: self.request_sender_user.clone(),
+        }
     }
 }
