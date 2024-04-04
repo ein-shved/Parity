@@ -283,6 +283,27 @@ async fn get_notice_sender() {
     _ = sender.notify(String::from("Hello world!"));
 }
 
+struct RequestProcessorImpl<Data> {
+    channel: mpsc::Receiver<RequestImp<Data>>,
+}
+
+#[async_trait]
+impl<Data: Send> crate::RequestProcessor<Data> for RequestProcessorImpl<Data> {
+    async fn next_request(&mut self) -> Result<RequestImp<Data>> {
+        let req = self.channel.recv().await.unwrap();
+        Ok(req)
+    }
+}
+
+#[tokio::test]
+async fn get_request_processor() {
+    use crate::RequestProcessor;
+
+    let mut bidir = Bidirect::<String>::new();
+    let mut processor = bidir.get_request_processor();
+    _ = processor.next_request();
+}
+
 impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
     fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
         RequestSenderImpl {
@@ -294,5 +315,11 @@ impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, D
         NoticeSenderImpl {
             channel: self.notice_sender_user.clone(),
         }
+    }
+
+    fn get_request_processor(&mut self) -> impl crate::RequestProcessor<Data> + 'b {
+        let (tx, rx) = mpsc::channel(16);
+        self.request_processor = Some(tx);
+        RequestProcessorImpl { channel: rx }
     }
 }
