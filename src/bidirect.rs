@@ -241,3 +241,31 @@ impl<Data> Request<Data> for RequestImp<Data> {
         Ok(())
     }
 }
+
+struct RequestSenderImpl<Data> {
+    channel: mpsc::Sender<SelfRequest<Data>>,
+}
+
+impl<Data> RequestSender<Data> for RequestSenderImpl<Data> {
+    async fn request(&mut self, req: Data) -> Result<Data> {
+        let (tx, rx) = oneshot::channel();
+        let req = SelfRequest { msg: req, tx };
+        self.channel.send(req).await.unwrap();
+        rx.await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn get_request_sender() {
+    let mut bidir = Bidirect::<String>::new();
+    let mut sender = bidir.get_request_sender();
+    _ = sender.request(String::from("Hello world!"));
+}
+
+impl<'b, Data: 'b, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
+    fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
+        RequestSenderImpl {
+            channel: self.request_sender_user.clone(),
+        }
+    }
+}
