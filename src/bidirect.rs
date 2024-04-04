@@ -300,6 +300,26 @@ async fn get_request_processor() {
     _ = processor.next_request();
 }
 
+struct NoticeProcessorImpl<Data> {
+    channel: mpsc::Receiver<Data>,
+}
+
+impl<Data> crate::NoticeProcessor<Data> for NoticeProcessorImpl<Data> {
+    async fn next_notice(&mut self) -> Result<Data> {
+        let req = self.channel.recv().await.unwrap();
+        Ok(req)
+    }
+}
+
+#[tokio::test]
+async fn get_notice_processor() {
+    use crate::NoticeProcessor;
+
+    let mut bidir = Bidirect::<String>::new();
+    let mut processor = bidir.get_notice_processor();
+    _ = processor.next_notice();
+}
+
 impl<'b, Data: 'b, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
     fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
         RequestSenderImpl {
@@ -317,5 +337,11 @@ impl<'b, Data: 'b, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI
         let (tx, rx) = mpsc::channel(16);
         self.request_processor = Some(tx);
         RequestProcessorImpl { channel: rx }
+    }
+
+    fn get_notice_processor(&mut self) -> impl crate::NoticeProcessor<Data> + 'b {
+        let (tx, rx) = mpsc::channel(16);
+        self.notice_processor = Some(tx);
+        NoticeProcessorImpl { channel: rx }
     }
 }
