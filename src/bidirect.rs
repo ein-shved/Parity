@@ -264,10 +264,35 @@ async fn get_request_sender() {
     _ = sender.request(String::from("Hello world!"));
 }
 
+struct NoticeSenderImpl<Data> {
+    channel: mpsc::Sender<Data>,
+}
+
+#[async_trait]
+impl<Data: Send> NoticeSender<Data> for NoticeSenderImpl<Data> {
+    async fn notify(&mut self, notice: Data) -> Status {
+        self.channel.send(notice).await.unwrap();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn get_notice_sender() {
+    let mut bidir = Bidirect::<String>::new();
+    let mut sender = bidir.get_notice_sender();
+    _ = sender.notify(String::from("Hello world!"));
+}
+
 impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
     fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
         RequestSenderImpl {
             channel: self.request_sender_user.clone(),
+        }
+    }
+
+    fn get_notice_sender(&mut self) -> impl NoticeSender<Data> + 'b {
+        NoticeSenderImpl {
+            channel: self.notice_sender_user.clone(),
         }
     }
 }
