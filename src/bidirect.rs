@@ -36,12 +36,14 @@ where
 
     request_sender: mpsc::Receiver<SelfRequest<Data>>,
     notice_sender: mpsc::Receiver<Data>,
+    aborter: mpsc::Receiver<()>,
 
     request_processor: RequestProcessor<Data>,
     notice_processor: NoticeProcessor<Data>,
 
     request_sender_user: mpsc::Sender<SelfRequest<Data>>,
     notice_sender_user: mpsc::Sender<Data>,
+    aborter_user: mpsc::Sender<()>,
 
     inbound_requests: InRequestsMap<'a, Data, SI>,
     outgoing_requests: OutRequestsMap<Data, SI>,
@@ -60,17 +62,20 @@ where
     pub fn new() -> Self {
         let (request_sender_user, request_sender) = mpsc::channel::<SelfRequest<Data>>(16);
         let (notice_sender_user, notice_sender) = mpsc::channel::<Data>(16);
+        let (aborter_user, aborter) = mpsc::channel::<()>(2);
         Self {
             seq_id: SI::zero(),
 
             request_sender,
             notice_sender,
+            aborter,
 
             request_processor: Default::default(),
             notice_processor: Default::default(),
 
             request_sender_user,
             notice_sender_user,
+            aborter_user,
 
             inbound_requests: Default::default(),
             outgoing_requests: Default::default(),
@@ -120,6 +125,8 @@ where
             not = self.notice_sender.recv() => Self::send_notice_next(
                     not,
                     &mut self.send_queue),
+
+            _ = self.aborter.recv() => Result::Err(Error::new(io::ErrorKind::ConnectionAborted, "Aborted by user")),
 
         }
     }
