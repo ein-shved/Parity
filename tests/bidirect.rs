@@ -139,3 +139,48 @@ impl<
         self.tasks.push(task)
     }
 }
+
+#[tokio::test]
+async fn test_abort() {
+    let mut test = <TestMaker>::make_test_set();
+    let mut abort = test.stream().get_aborter();
+
+    test.add(async move {
+        abort.abort().await.unwrap();
+    });
+
+    test.run().await;
+}
+
+#[tokio::test]
+async fn test_send_request() {
+    let mut test = <TestMaker>::make_test_set();
+
+    let mut req = test.stream().get_request_sender();
+    let mut abort = test.stream().get_aborter();
+    let tx = test.tx();
+    let mut rx = test.rx().unwrap();
+
+    test.add(async move {
+        let res = req.request("Hello world?".into()).await.unwrap();
+        println!("Got responce: {}", res);
+        assert!(res == "Hello world!");
+        abort.abort().await.unwrap();
+    });
+
+    test.add(async move {
+        let msg = rx.recv().await.unwrap();
+        if let Message::Request(si, data) = msg {
+            assert!(si == 0);
+            assert!(data == "Hello world?");
+            println!("Got request: {}", data);
+        } else {
+            panic!("Message is not Request!");
+        }
+        tx.send(Message::Response(0, "Hello world!".into()))
+            .await
+            .unwrap();
+    });
+
+    test.run().await;
+}
