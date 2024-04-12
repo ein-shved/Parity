@@ -320,6 +320,24 @@ async fn get_notice_processor() {
     _ = processor.next_notice();
 }
 
+struct AborterImpl {
+    channel: mpsc::Sender<()>,
+}
+
+impl crate::Aborter for AborterImpl {
+    async fn abort(&mut self) -> Status {
+        self.channel.send(()).await.unwrap();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn get_aborter() {
+    let mut bidir = Bidirect::<String>::new();
+    let mut aborter = bidir.get_aborter();
+    _ = aborter.abort();
+}
+
 impl<'b, Data: 'b, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
     fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
         RequestSenderImpl {
@@ -343,5 +361,11 @@ impl<'b, Data: 'b, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI
         let (tx, rx) = mpsc::channel(16);
         self.notice_processor = Some(tx);
         NoticeProcessorImpl { channel: rx }
+    }
+
+    fn get_aborter(&mut self) -> impl crate::Aborter + 'b {
+        AborterImpl {
+            channel: self.aborter_user.clone(),
+        }
     }
 }
