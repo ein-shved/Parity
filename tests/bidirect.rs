@@ -184,3 +184,39 @@ async fn test_send_request() {
 
     test.run().await;
 }
+
+#[tokio::test]
+async fn test_send_response() {
+    let mut test = <TestMaker>::make_test_set();
+
+    let mut proc = test.stream().get_request_processor();
+    let mut abort = test.stream().get_aborter();
+
+    let tx = test.tx();
+    let mut rx = test.rx().unwrap();
+
+    test.add(async move {
+        tx.send(Message::Request(10, "Hello world?".into()))
+            .await
+            .unwrap();
+        let rsp = rx.recv().await.unwrap();
+        if let Message::Response(si, data) = rsp {
+            assert!(si == 10);
+            assert!(data == "Hello world!");
+            println!("Got response: {}", data);
+        } else {
+            panic!("Message is not response");
+        }
+        abort.abort().await.unwrap();
+    });
+
+    test.add(async move {
+        let req = proc.next_request().await.unwrap();
+        let req_data = req.get_data();
+
+        assert!(req_data == "Hello world?");
+        req.response(Ok("Hello world!".into())).await.unwrap();
+    });
+
+    test.run().await;
+}
