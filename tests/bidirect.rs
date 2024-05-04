@@ -131,6 +131,30 @@ impl<
         }
     }
 
+    pub fn connect_to(&mut self, other: &mut Self) {
+        let tx = self.tx();
+        let mut rx = other.rx().unwrap();
+        self.add(async move {
+            loop {
+                let msg = rx.recv().await;
+                if let Some(msg) = msg {
+                    tx.send(msg).await.unwrap();
+                } else {
+                    break;
+                }
+            }
+        })
+    }
+
+    pub async fn run_double(mut self, mut other: Self) {
+        self.connect_to(&mut other);
+        other.connect_to(&mut self);
+
+        self.add(other.run());
+
+        self.run().await
+    }
+
     pub fn add<F>(&mut self, f: F)
     where
         F: Future<Output = ()> + 'static,
