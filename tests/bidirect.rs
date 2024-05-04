@@ -220,3 +220,58 @@ async fn test_send_response() {
 
     test.run().await;
 }
+
+#[tokio::test]
+async fn test_recv_notice() {
+    let mut test = <TestMaker>::make_test_set();
+
+    let mut notc = test.stream().get_notice_processor();
+    let mut abort = test.stream().get_aborter();
+
+    let tx = test.tx();
+
+    test.add(async move {
+        tx.send(Message::Notice("Hello world?".into()))
+            .await
+            .unwrap();
+    });
+
+    test.add(async move {
+        let data = notc.next_notice().await.unwrap();
+
+        println!("Got notice: {}", data);
+        assert!(data == "Hello world?");
+
+        abort.abort().await.unwrap();
+    });
+
+    test.run().await;
+}
+
+#[tokio::test]
+async fn test_send_notice() {
+    let mut test = <TestMaker>::make_test_set();
+
+    let mut notc = test.stream().get_notice_sender();
+    let mut abort = test.stream().get_aborter();
+
+    let mut rx = test.rx().unwrap();
+
+    test.add(async move {
+        let data = rx.recv().await.unwrap();
+        if let Message::Notice(data) = data {
+            assert!(data == "Hello world!");
+            println!("Got notice: {}", data);
+        } else {
+            panic!("Message is not notice");
+        }
+
+        abort.abort().await.unwrap();
+    });
+
+    test.add(async move {
+        notc.notify("Hello world!".into()).await.unwrap();
+    });
+
+    test.run().await;
+}
