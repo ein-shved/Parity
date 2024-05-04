@@ -299,3 +299,65 @@ async fn test_send_notice() {
 
     test.run().await;
 }
+
+#[tokio::test]
+async fn test_double_request()
+{
+    let mut t1 = <TestMaker>::make_test_set();
+    let mut t2 = <TestMaker>::make_test_set();
+
+    let mut req = t1.stream().get_request_sender();
+    let mut proc = t2.stream().get_request_processor();
+
+    let mut abort1 = t1.stream().get_aborter();
+    let mut abort2 = t2.stream().get_aborter();
+
+    t1.add(async move {
+        let res = req.request("Hello world?".into()).await.unwrap();
+        println!("Got responce: {}", res);
+        assert!(res == "Hello world!");
+
+        abort1.abort().await.unwrap();
+        abort2.abort().await.unwrap();
+    });
+
+    t2.add(async move {
+        let req = proc.next_request().await.unwrap();
+        let req_data = req.get_data();
+
+        println!("Got request: {}", req_data);
+        assert!(req_data == "Hello world?");
+        req.response(Ok("Hello world!".into())).await.unwrap();
+    });
+
+    t1.run_double(t2).await;
+}
+
+#[tokio::test]
+async fn test_double_notice()
+{
+    let mut t1 = <TestMaker>::make_test_set();
+    let mut t2 = <TestMaker>::make_test_set();
+
+    let mut ntc1 = t1.stream().get_notice_sender();
+    let mut ntc2 = t2.stream().get_notice_processor();
+
+    let mut abort1 = t1.stream().get_aborter();
+    let mut abort2 = t2.stream().get_aborter();
+
+    t1.add(async move {
+        ntc1.notify("Hello world!".into()).await.unwrap();
+    });
+
+    t2.add(async move {
+        let data = ntc2.next_notice().await.unwrap();
+
+        println!("Got notice: {}", data);
+        assert!(data == "Hello world!");
+
+        abort1.abort().await.unwrap();
+        abort2.abort().await.unwrap();
+    });
+
+    t1.run_double(t2).await;
+}
