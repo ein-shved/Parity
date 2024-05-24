@@ -361,3 +361,74 @@ async fn test_double_notice()
 
     t1.run_double(t2).await;
 }
+
+
+#[tokio::test]
+async fn test_send_multi_request() {
+    let mut test = <TestMaker>::make_test_set();
+
+    let mut req1 = test.stream().get_request_sender();
+    let mut req2 = test.stream().get_request_sender();
+    let mut req3 = test.stream().get_request_sender();
+
+    let mut abort = test.stream().get_aborter();
+    let tx = test.tx();
+    let mut rx = test.rx().unwrap();
+
+    let (abort_tx1, mut abort_rx) = mpsc::channel::<()>(3);
+    let abort_tx2 = abort_tx1.clone();
+    let abort_tx3 = abort_tx1.clone();
+
+    test.add(async move {
+        let res = req1.request("Hello world 1".into()).await.unwrap();
+        println!("Got responce: {}", res);
+        assert!(res == "Hello world 1 + Hello!");
+        abort_tx1.send(()).await.unwrap();
+    });
+
+    test.add(async move {
+        let res = req2.request("Hello world 2".into()).await.unwrap();
+        println!("Got responce: {}", res);
+        assert!(res == "Hello world 2 + Hello!");
+        abort_tx2.send(()).await.unwrap();
+    });
+
+    test.add(async move {
+        let res = req3.request("Hello world 3".into()).await.unwrap();
+        println!("Got responce: {}", res);
+        assert!(res == "Hello world 3 + Hello!");
+        abort_tx3.send(()).await.unwrap();
+    });
+
+    test.add(async move {
+        abort_rx.recv().await.unwrap();
+        abort_rx.recv().await.unwrap();
+        abort_rx.recv().await.unwrap();
+
+        abort.abort().await.unwrap();
+    });
+
+    test.add(async move {
+        let msg1 = rx.recv().await.unwrap();
+        let msg2 = rx.recv().await.unwrap();
+        let msg3 = rx.recv().await.unwrap();
+
+        async fn check_send_response(msg: Message<String, u16>, tx: &mpsc::Sender<Message<String, u16>>)
+        {
+            if let Message::Request(si, data) = msg {
+                assert!(&data[0 .. 12] == "Hello world ");
+                println!("Got request: {}", data);
+                tx.send(Message::Response(si, data + " + Hello!"))
+                    .await
+                    .unwrap();
+            } else {
+                panic!("Message is not Request!");
+            }
+        }
+        check_send_response(msg1, &tx).await;
+        check_send_response(msg2, &tx).await;
+        check_send_response(msg3, &tx).await;
+    });
+
+    test.run().await;
+}
