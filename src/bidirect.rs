@@ -1,36 +1,29 @@
 use super::*;
 use crate::streams::*;
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    io,
-    pin::Pin,
-};
+use std::{collections::BTreeMap, io};
 
 use tokio::{
     select,
     sync::{mpsc, oneshot},
+    task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use futures::{stream::FuturesUnordered, Future, StreamExt};
 
 struct SelfRequest<Data> {
     pub msg: Data,
     pub tx: oneshot::Sender<Result<Data>>,
 }
 
-type MessageQueue<Data, SI> = VecDeque<Message<Data, SI>>;
-type NoticeQueue<Data> = VecDeque<Data>;
-type RequestQueue<Data, SI> = VecDeque<(Data, SI)>;
-type InRequestsMap<'a, Data, SI> =
-    FuturesUnordered<Pin<Box<dyn Future<Output = Message<Data, SI>> + 'a>>>;
+type SendQueue<Data, SI> = mpsc::Sender<Message<Data, SI>>;
 type OutRequestsMap<Data, SI> = BTreeMap<SI, oneshot::Sender<Result<Data>>>;
 type RequestProcessor<Data> = Option<mpsc::Sender<RequestImp<Data>>>;
 type NoticeProcessor<Data> = Option<mpsc::Sender<Data>>;
+type JobsSet = std::collections::LinkedList<JoinHandle<Status>>;
 
-pub struct Bidirect<'a, Data: 'a, SI = u16>
+pub struct Bidirect<Data, SI = u16>
 where
-    SI: SeqId + 'a,
+    SI: SeqId,
 {
     seq_id: SI,
 
@@ -44,23 +37,19 @@ where
     request_sender_user: mpsc::Sender<SelfRequest<Data>>,
     notice_sender_user: mpsc::Sender<Data>,
 
-    inbound_requests: InRequestsMap<'a, Data, SI>,
     outgoing_requests: OutRequestsMap<Data, SI>,
-
-    send_queue: MessageQueue<Data, SI>,
-    receive_request_queue: RequestQueue<Data, SI>,
-    receive_notice_queue: NoticeQueue<Data>,
 }
 
 pub struct DefaultRequestProcessor {}
 
-impl<'a, Data: 'a, SI> Bidirect<'a, Data, SI>
+impl<Data, SI> Bidirect<Data, SI>
 where
-    SI: SeqId + 'a,
+    Data: 'static + Send,
+    SI: SeqId + 'static + Send,
 {
     pub fn new() -> Self {
-        let (request_sender_user, request_sender) = mpsc::channel::<SelfRequest<Data>>(16);
-        let (notice_sender_user, notice_sender) = mpsc::channel::<Data>(16);
+        let (request_sender_user, request_sender) = mpsc::channel(16);
+        let (notice_sender_user, notice_sender) = mpsc::channel(16);
         Self {
             seq_id: SI::zero(),
 
@@ -74,128 +63,156 @@ where
             request_sender_user,
             notice_sender_user,
 
-            inbound_requests: Default::default(),
             outgoing_requests: Default::default(),
-
-            send_queue: Default::default(),
-            receive_request_queue: Default::default(),
-            receive_notice_queue: Default::default(),
         }
     }
 
-    pub async fn next(
+    pub async fn event_loop(
         &mut self,
-        sender: &mut impl MessageSender<Data, SI>,
-        receiver: &mut impl MessageReceiver<Data, SI>,
+        mut sender: impl MessageSender<Data, SI> + 'static + Send,
+        mut receiver: impl MessageReceiver<Data, SI>,
     ) -> Status {
-        // TODO(Shvedov): Performance gap here. Move to tasks.
-        if let Some(to_send) = self.send_queue.pop_back() {
-            return sender.send(to_send).await;
-        }
-        if let Some(in_request) = self.receive_request_queue.pop_back() {
-            let fut = Self::process_request_next(in_request, &mut self.request_processor).await;
-            return fut.map(|fut| {
-                self.inbound_requests.push(fut);
-            });
-        }
-        if let Some(in_notice) = self.receive_notice_queue.pop_back() {
-            return Self::process_notice_next(in_notice, &mut self.notice_processor).await;
-        }
+        let (mpsc_send_tx, mut mpsc_send_rx) = mpsc::channel::<Message<Data, SI>>(16);
+        let mut jobs = JobsSet::new();
+        let canceller = self.canceller.clone();
 
-        select! {
-            msg = receiver.recv() => self.process_next(msg),
-
-            rsp = self.inbound_requests.next(), if !self.inbound_requests.is_empty() =>
-            {
-                if let Some(rsp) = rsp {
-                    self.send_queue.push_front(rsp);
+        jobs.push_back(tokio::spawn(async move {
+            println!("Starting loop");
+            let res = loop {
+                select! {
+                    msg = mpsc_send_rx.recv() =>
+                        if let Some(msg) = msg {
+                            sender.send(msg).await?;
+                        },
+                    _ = canceller.cancelled() => {
+                        println!("Loop breaked!");
+                        break Result::Err(Error::new(io::ErrorKind::Interrupted, "Aborted by user"))
+                    },
                 }
-                Ok(())
+            };
+            println!("Loop finished");
+            res
+        }));
+
+        let res = loop {
+            select! {
+                msg = receiver.recv() => self.process_next(msg, mpsc_send_tx.clone(), &mut jobs),
+
+                req = self.request_sender.recv() => Self::send_request_next(
+                        req,
+                        &mut self.seq_id,
+                        mpsc_send_tx.clone(),
+                        &mut self.outgoing_requests, &mut jobs),
+
+                not = self.notice_sender.recv() => Self::send_notice_next(
+                        not,
+                        mpsc_send_tx.clone(), &mut jobs),
+                _ = self.canceller.cancelled() => {
+                    break Result::Err(Error::new(io::ErrorKind::Interrupted, "Aborted by user"))
+                },
+            }?;
+            let res = loop {
+                if let Some(last) = jobs.back() {
+                    if last.is_finished() {
+                        let res = jobs.pop_back().unwrap().await?;
+                        if res.is_err() {
+                            break res;
+                        }
+                    } else {
+                        break Ok(());
+                    }
+                } else {
+                    break Result::Err(Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Jobs list is empty",
+                    ));
+                }
+            };
+            if res.is_err() {
+                break res;
             }
+        };
 
-            req = self.request_sender.recv() => Self::send_request_next(
-                    req,
-                    &mut self.seq_id,
-                    &mut self.send_queue,
-                    &mut self.outgoing_requests),
-
-            not = self.notice_sender.recv() => Self::send_notice_next(
-                    not,
-                    &mut self.send_queue),
-
-            _ = self.canceller.cancelled() => Result::Err(Error::new(io::ErrorKind::ConnectionAborted, "Aborted by user")),
-
+        while !jobs.is_empty() {
+            let res = jobs.pop_back().unwrap().await?;
+            if let Err(err) = res {
+                println!("Error occured with job while aborting: {}", err);
+            }
         }
+        res
     }
 
-    fn process_next(&mut self, msg: ResultMessage<Data, SI>) -> Status {
+    fn process_next(
+        &mut self,
+        msg: ResultMessage<Data, SI>,
+        send: SendQueue<Data, SI>,
+        jobs: &mut JobsSet,
+    ) -> Status {
         match msg {
             Ok(msg) => match msg {
-                Message::Request(si, data) => self.process_request(si, data),
-                Message::Response(si, data) => self.process_response(si, Ok(data)),
-                Message::Notice(data) => self.process_notice(data),
-                Message::Err(err, si) => self.process_err(err, si),
+                Message::Request(si, data) => self.process_request((si, data), send.clone(), jobs),
+                Message::Response(si, data) => self.process_response(si, Ok(data), jobs),
+                Message::Notice(data) => self.process_notice(data, jobs),
+                Message::Err(err, si) => self.process_err(err, si, jobs),
             },
             Err(err) => Err(err),
         }
     }
 
-    fn process_request(&mut self, si: SI, data: Data) -> Status {
-        self.receive_request_queue.push_front((data, si));
-        Ok(())
-    }
+    fn process_request(
+        &self,
+        req: (SI, Data),
+        sender: SendQueue<Data, SI>,
+        jobs: &mut JobsSet,
+    ) -> Status {
+        let processor = self.request_processor.clone();
+        jobs.push_back(tokio::spawn(async move {
+            let (si, data) = req;
+            let rsp = if let Some(processor) = processor {
+                let (tx, rx) = oneshot::channel::<Result<Data>>();
+                let req = RequestImp::<Data> {
+                    data,
+                    responser: tx,
+                };
 
-    async fn process_request_next(
-        req: (Data, SI),
-        processor: &mut RequestProcessor<Data>,
-    ) -> Result<Pin<Box<dyn Future<Output = Message<Data, SI>> + 'a>>> {
-        let (data, si) = req;
-        if let Some(processor) = processor {
-            let (tx, rx) = oneshot::channel::<Result<Data>>();
-            let req = RequestImp::<Data> {
-                data,
-                responser: tx,
-            };
-
-            processor.send(req).await.unwrap();
-            let fut = async move {
+                processor.send(req).await.unwrap();
                 let rsp = rx.await.unwrap();
                 match rsp {
                     Ok(rsp) => Message::Response(si, rsp),
                     Err(err) => Message::Err(err, Some(si)),
                 }
+            } else {
+                Message::not_implemented("").set_si(si)
             };
-            Ok(Box::pin(fut))
-        } else {
-            let fut = async move { Message::not_implemented("").set_si(si) };
-            Ok(Box::pin(fut))
-        }
-    }
-
-    fn process_notice(&mut self, data: Data) -> Status {
-        self.receive_notice_queue.push_front(data);
+            sender.send(rsp).await?;
+            Ok(()) as Status
+        }));
         Ok(())
     }
 
-    async fn process_notice_next(data: Data, processor: &mut NoticeProcessor<Data>) -> Status {
-        if let Some(processor) = processor {
-            // TODO(Shvedov): Process result
-            processor.send(data).await.unwrap();
-        }
+    fn process_notice(&self, data: Data, jobs: &mut JobsSet) -> Status {
+        let processor = self.notice_processor.clone();
+        jobs.push_back(tokio::spawn(async move {
+            if let Some(processor) = processor {
+                processor.send(data).await?;
+            }
+            Ok(()) as Status
+        }));
         Ok(())
     }
 
-    fn process_response(&mut self, si: SI, data: Result<Data>) -> Status {
+    fn process_response(&mut self, si: SI, data: Result<Data>, _: &mut JobsSet) -> Status {
         if let Some(waiter) = self.outgoing_requests.remove(&si) {
-            // TODO(Shvedov): Process result
-            waiter.send(data);
+            waiter
+                .send(data)
+                .map_err(|_| Error::pipe(&format!("Response waiter closed for {}", si)))?;
         }
         Ok(())
     }
 
-    fn process_err(&mut self, data: Error, si: Option<SI>) -> Status {
+    fn process_err(&mut self, data: Error, si: Option<SI>, jobs: &mut JobsSet) -> Status {
         if let Some(si) = si {
-            self.process_response(si, Err(data))
+            self.process_response(si, Err(data), jobs)
         } else {
             // TODO(Shvedov): Notify user about error
             Ok(())
@@ -205,20 +222,32 @@ where
     fn send_request_next(
         req: Option<SelfRequest<Data>>,
         si: &mut SI,
-        send_queue: &mut MessageQueue<Data, SI>,
+        sender: SendQueue<Data, SI>,
         requests_map: &mut OutRequestsMap<Data, SI>,
+        jobs: &mut JobsSet,
     ) -> Status {
         if let Some(req) = req {
-            send_queue.push_front(Message::Request(*si, req.msg));
-            requests_map.insert(*si, req.tx);
+            let mysi = *si;
             *si = (*si).inc();
+            requests_map.insert(mysi, req.tx);
+            jobs.push_back(tokio::spawn(async move {
+                sender.send(Message::Request(mysi, req.msg)).await?;
+                Ok(()) as Status
+            }));
         }
         Ok(())
     }
 
-    fn send_notice_next(not: Option<Data>, send_queue: &mut MessageQueue<Data, SI>) -> Status {
+    fn send_notice_next(
+        not: Option<Data>,
+        sender: SendQueue<Data, SI>,
+        jobs: &mut JobsSet,
+    ) -> Status {
         if let Some(not) = not {
-            send_queue.push_front(Message::Notice(not));
+            jobs.push_back(tokio::spawn(async move {
+                sender.send(Message::Notice(not)).await?;
+                Ok(()) as Status
+            }));
         }
         Ok(())
     }
@@ -235,7 +264,9 @@ impl<Data: Send> Request<Data> for RequestImp<Data> {
         &self.data
     }
     async fn response(self, response: Result<Data>) -> Status {
-        self.responser.send(response); // TODO .expect("Failed to send response");
+        self.responser
+            .send(response)
+            .map_err(|_| Error::pipe("Failed to pipe response to requester"))?;
         Ok(())
     }
 }
@@ -341,7 +372,7 @@ async fn get_aborter() {
     _ = aborter.abort();
 }
 
-impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, Data, SI> {
+impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<Data, SI> {
     fn get_request_sender(&mut self) -> impl RequestSender<Data> + 'b {
         RequestSenderImpl {
             channel: self.request_sender_user.clone(),

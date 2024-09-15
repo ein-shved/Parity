@@ -11,8 +11,6 @@ struct MpscSender<Data> {
     sender: mpsc::Sender<Data>,
 }
 
-type MpscMsgSender<Data = String, SI = u16> = MpscSender<Message<Data, SI>>;
-
 #[async_trait]
 impl<Data: Send> Sender<Data> for MpscSender<Data> {
     async fn send(&mut self, msg: Data) -> Status {
@@ -24,7 +22,6 @@ impl<Data: Send> Sender<Data> for MpscSender<Data> {
 struct MpscReceiver<Data> {
     receiver: mpsc::Receiver<Data>,
 }
-type MpscMsgReceiver<Data = String, SI = u16> = MpscReceiver<Message<Data, SI>>;
 
 #[async_trait]
 impl<Data: Send> Receiver<Data> for MpscReceiver<Data> {
@@ -53,7 +50,7 @@ impl<'a, Data: 'a + Send, SI: SeqId + 'a + Send> TestMaker<Data, SI> {
     ) -> TestSet<impl MessageSender<Data, SI>, impl MessageReceiver<Data, SI>, Data, SI> {
         let (mtx, rx) = TestMaker::<Message<Data, SI>>::make_test_sender();
         let (tx, mrx) = TestMaker::<Message<Data, SI>>::make_test_receiver();
-        let stream = Bidirect::<'static, Data, SI>::new();
+        let stream = Bidirect::<Data, SI>::new();
 
         let local = task::LocalSet::new();
 
@@ -70,12 +67,12 @@ impl<'a, Data: 'a + Send, SI: SeqId + 'a + Send> TestMaker<Data, SI> {
 }
 
 struct TestSet<
-    Snd: MessageSender<Data, SI>,
-    Rcv: MessageReceiver<Data, SI>,
-    Data: 'static = String,
-    SI: SeqId + 'static = u16,
+    Snd: MessageSender<Data, SI> + Send,
+    Rcv: MessageReceiver<Data, SI> + Send,
+    Data: 'static + Send = String,
+    SI: SeqId + 'static + Send = u16,
 > {
-    stream: Bidirect<'static, Data, SI>,
+    stream: Bidirect<Data, SI>,
     mtx: Snd,
     mrx: Rcv,
     tx: mpsc::Sender<Message<Data, SI>>,
@@ -86,13 +83,13 @@ struct TestSet<
 }
 
 impl<
-        Snd: MessageSender<Data, SI> + 'static,
-        Rcv: MessageReceiver<Data, SI> + 'static,
-        Data: 'static,
-        SI: SeqId + 'static,
+        Snd: MessageSender<Data, SI> + 'static + Send,
+        Rcv: MessageReceiver<Data, SI> + 'static + Send,
+        Data: 'static + Send,
+        SI: SeqId + 'static + Send,
     > TestSet<Snd, Rcv, Data, SI>
 {
-    pub fn stream(&mut self) -> &mut Bidirect<'static, Data, SI> {
+    pub fn stream(&mut self) -> &mut Bidirect<Data, SI> {
         &mut self.stream
     }
 
@@ -107,12 +104,9 @@ impl<
     }
 
     pub async fn looper(mut self) {
-        loop {
-            let res = &mut self.stream.next(&mut self.mtx, &mut self.mrx).await;
-            if let Err(err) = res {
-                println!("Stream finished with: {}", err);
-                break;
-            }
+        let res = &mut self.stream.event_loop(self.mtx, self.mrx).await;
+        if let Err(err) = res {
+            println!("Stream finished with: {}", err);
         }
     }
 
