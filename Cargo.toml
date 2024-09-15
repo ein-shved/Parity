@@ -9,3 +9,4 @@ futures = "0.3"
 num = "0.4"
 tokio = { version = "1", features = [ "full" ] }
 async-trait = "0.1.78"
+tokio-util = "0.7.12"

@@ -11,7 +11,7 @@ use tokio::{
     select,
     sync::{mpsc, oneshot},
 };
-
+use tokio_util::sync::CancellationToken;
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 
 struct SelfRequest<Data> {
@@ -36,14 +36,13 @@ where
 
     request_sender: mpsc::Receiver<SelfRequest<Data>>,
     notice_sender: mpsc::Receiver<Data>,
-    aborter: mpsc::Receiver<()>,
+    canceller: CancellationToken,
 
     request_processor: RequestProcessor<Data>,
     notice_processor: NoticeProcessor<Data>,
 
     request_sender_user: mpsc::Sender<SelfRequest<Data>>,
     notice_sender_user: mpsc::Sender<Data>,
-    aborter_user: mpsc::Sender<()>,
 
     inbound_requests: InRequestsMap<'a, Data, SI>,
     outgoing_requests: OutRequestsMap<Data, SI>,
@@ -62,20 +61,18 @@ where
     pub fn new() -> Self {
         let (request_sender_user, request_sender) = mpsc::channel::<SelfRequest<Data>>(16);
         let (notice_sender_user, notice_sender) = mpsc::channel::<Data>(16);
-        let (aborter_user, aborter) = mpsc::channel::<()>(2);
         Self {
             seq_id: SI::zero(),
 
             request_sender,
             notice_sender,
-            aborter,
+            canceller: Default::default(),
 
             request_processor: Default::default(),
             notice_processor: Default::default(),
 
             request_sender_user,
             notice_sender_user,
-            aborter_user,
 
             inbound_requests: Default::default(),
             outgoing_requests: Default::default(),
@@ -126,7 +123,7 @@ where
                     not,
                     &mut self.send_queue),
 
-            _ = self.aborter.recv() => Result::Err(Error::new(io::ErrorKind::ConnectionAborted, "Aborted by user")),
+            _ = self.canceller.cancelled() => Result::Err(Error::new(io::ErrorKind::ConnectionAborted, "Aborted by user")),
 
         }
     }
@@ -326,13 +323,13 @@ async fn get_notice_processor() {
 }
 
 struct AborterImpl {
-    channel: mpsc::Sender<()>,
+    canceller: CancellationToken,
 }
 
 #[async_trait]
 impl crate::Aborter for AborterImpl {
     async fn abort(&mut self) -> Status {
-        self.channel.send(()).await.unwrap();
+        self.canceller.cancel();
         Ok(())
     }
 }
@@ -371,7 +368,7 @@ impl<'b, Data: 'b + Send, SI: SeqId> BidirectStream<'b, Data> for Bidirect<'_, D
 
     fn get_aborter(&mut self) -> impl crate::Aborter + 'b {
         AborterImpl {
-            channel: self.aborter_user.clone(),
+            canceller: self.canceller.clone(),
         }
     }
 }
