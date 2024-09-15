@@ -102,3 +102,28 @@ where
         self.parser.parse(self.reciever.recv().await?)
     }
 }
+
+pub struct DummySender{}
+
+#[async_trait]
+impl<Data, SI> MessageSender<Data, SI> for DummySender
+where
+    Data: 'static + Send,
+    SI: SeqId + 'static + Send,
+{
+    async fn send(&mut self, _: Message<Data, SI>) -> Status {
+        Ok(())
+    }
+}
+
+pub struct DummyReceiver {}
+
+#[async_trait]
+impl<Data, SI> MessageReceiver<Data, SI> for DummyReceiver
+where
+    SI: SeqId,
+{
+    async fn recv(&mut self) -> ResultMessage<Data, SI> {
+        std::future::pending().await
+    }
+}
